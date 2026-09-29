@@ -1,0 +1,181 @@
+name: Microservices CI/CD
+
+# Every folder under services/ that has a service.conf is a service.
+# Only services whose files changed are tested / built / deployed.
+# A change to infra/service.yaml redeploys all services.
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['services/**', 'infra/service.yaml', '.github/workflows/deploy.yml']
+  push:
+    branches: [main]
+    paths: ['services/**', 'infra/service.yaml', '.github/workflows/deploy.yml']
+  workflow_dispatch:
+    inputs:
+      service:
+        description: 'Service to deploy (folder name), or "all"'
+        required: true
+        default: all
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  detect:
+    name: Detect changed services
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.detect.outputs.services }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: detect
+        env:
+          BEFORE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          INPUT_SERVICE: ${{ github.event.inputs.service }}
+        run: |
+          ALL=$(for d in services/*/; do [ -f "$d/service.conf" ] && basename "$d"; done)
+
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$INPUT_SERVICE" = "all" ]; then CHANGED="$ALL"; else CHANGED="$INPUT_SERVICE"; fi
+          elif [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            CHANGED="$ALL"
+          else
+            FILES=$(git diff --name-only "$BEFORE" "$GITHUB_SHA")
+            echo "Changed files:"; echo "$FILES"
+            if echo "$FILES" | grep -qE '^(infra/service.yaml|\.github/workflows/deploy.yml)$'; then
+              CHANGED="$ALL"
+            else
+              CHANGED=$(echo "$FILES" | grep '^services/' | cut -d/ -f2 | sort -u)
+            fi
+          fi
+
+          # keep only real services (folder with service.conf)
+          JSON=$(for s in $CHANGED; do [ -f "services/$s/service.conf" ] && echo "$s"; done | jq -R . | jq -sc .)
+          echo "Services: $JSON"
+          echo "services=$JSON" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test ${{ matrix.service }}
+    needs: detect
+    if: needs.detect.outputs.services != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.detect.outputs.services) }}
+    defaults:
+      run:
+        working-directory: services/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: services/${{ matrix.service }}/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  validate:
+    name: Validate CloudFormation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install cfn-lint
+      - run: cfn-lint infra/*.yaml
+
+  deploy:
+    name: Deploy ${{ matrix.service }}
+    needs: [detect, test, validate]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.detect.outputs.services != '[]'
+    runs-on: ubuntu-latest
+    environment: production
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.detect.outputs.services) }}
+    concurrency:
+      group: deploy-${{ matrix.service }}
+      cancel-in-progress: false
+    env:
+      SERVICE: ${{ matrix.service }}
+      STACK_NAME: svc-${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repo if missing
+        run: |
+          aws ecr describe-repositories --repository-names "$SERVICE" >/dev/null 2>&1 || \
+            aws ecr create-repository --repository-name "$SERVICE" \
+              --image-scanning-configuration scanOnPush=true >/dev/null
+          echo "ECR repo: $SERVICE"
+
+      - name: Build and push image
+        id: image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          TAG=${GITHUB_SHA::7}
+          IMAGE=$REGISTRY/$SERVICE
+          docker build -t $IMAGE:$TAG -t $IMAGE:latest services/$SERVICE
+          docker push $IMAGE:$TAG
+          docker push $IMAGE:latest
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "repo_uri=$IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Deploy CloudFormation stack
+        run: |
+          set -a; source services/$SERVICE/service.conf; set +a
+          aws cloudformation deploy \
+            --stack-name "$STACK_NAME" \
+            --template-file infra/service.yaml \
+            --capabilities CAPABILITY_IAM \
+            --role-arn "${{ vars.CFN_EXECUTION_ROLE_ARN }}" \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              ServiceName="$SERVICE" \
+              PathPattern="$PATH_PATTERN" \
+              ListenerRulePriority="$PRIORITY" \
+              ContainerPort="$PORT" \
+              TaskCpu="$CPU" TaskMemory="$MEMORY" \
+              DesiredCount="$DESIRED" MinCapacity="$MIN" MaxCapacity="$MAX" \
+              ClusterName="${{ vars.ECS_CLUSTER_NAME }}" \
+              VpcId="${{ vars.VPC_ID }}" \
+              TaskSubnets="${{ vars.TASK_SUBNETS }}" \
+              AssignPublicIp="${{ vars.ASSIGN_PUBLIC_IP }}" \
+              AlbListenerArn="${{ vars.ALB_LISTENER_ARN }}" \
+              AlbSecurityGroupId="${{ vars.ALB_SG_ID }}" \
+              ServicesSecurityGroupId="${{ vars.SERVICES_SG_ID }}" \
+              ServiceConnectNamespaceArn="${{ vars.SC_NAMESPACE_ARN }}" \
+              EcrRepoUri="${{ steps.image.outputs.repo_uri }}" \
+              ImageTag="${{ steps.image.outputs.tag }}"
+
+      - name: Show stack status
+        if: always()
+        run: |
+          aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].{Status:StackStatus,Outputs:Outputs}' --output json || true
+          if [ "${{ job.status }}" != "success" ]; then
+            echo "---- Recent failures ----"
+            aws cloudformation describe-stack-events --stack-name "$STACK_NAME" \
+              --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatusReason] | [0:5]" \
+              --output text || true
+          fi
